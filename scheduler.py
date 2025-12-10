@@ -301,6 +301,7 @@ def parse_done_list(operator_field: str) -> List[str]:
     Looks for:
     1. Pattern "robots_done: 25,27" (full format)
     2. Just robot IDs like "26" or "25,27" (simplified format)
+    3. Robot IDs separated by commas, pipes, or other delimiters
     
     Args:
         operator_field: Content of Operator column (Q)
@@ -311,31 +312,46 @@ def parse_done_list(operator_field: str) -> List[str]:
     if not operator_field:
         return []
     
-    text = operator_field.replace(" ", "")
-    robots = []
-    
     # First, try to match "robots_done:25,26,27" or "robots_done: 25, 26" format
-    match = re.search(r"robots_done:([\d,]+)", text, re.I)
+    # Use case-insensitive search and handle spaces
+    match = re.search(r"robots_done:\s*([\d,\s]+)", operator_field, re.I)
     if match:
         raw = match.group(1)
-        robots = [r.strip() for r in raw.split(",") if r.strip()]
-    else:
-        # Look for standalone robot IDs (just numbers that match robot names)
-        # Match patterns like "26" or "25,27" or "26 " (with spaces/commas)
-        # Extract all valid robot IDs from the text
-        for robot_id in ROBOT_NAMES:
-            # Look for the robot ID as a standalone number (not part of a larger number)
-            # Match word boundaries or comma-separated values
-            pattern = r'\b' + re.escape(robot_id) + r'\b'
-            if re.search(pattern, text):
-                if robot_id not in robots:
-                    robots.append(robot_id)
+        robots = [r.strip() for r in raw.split(",") if r.strip() and r.strip() in ROBOT_NAMES]
+        if robots:
+            return robots
+    
+    # Look for standalone robot IDs in the text
+    # Try to find robot IDs that are:
+    # 1. Standalone numbers (not part of larger numbers)
+    # 2. Separated by commas, pipes, spaces, or other delimiters
+    # 3. At the start/end of the text
+    robots = []
+    
+    # First, try to extract comma-separated or pipe-separated robot IDs
+    # Look for patterns like "25,26,27" or "25|26|27" or "25 26 27"
+    # Split by common delimiters and check if each part is a valid robot ID
+    text_parts = re.split(r'[,|;:\s]+', operator_field)
+    for part in text_parts:
+        part = part.strip()
+        if part in ROBOT_NAMES and part not in robots:
+            robots.append(part)
+    
+    # Also search for robot IDs using word boundaries (handles cases like "Operator: John 25")
+    # This catches robot IDs that might be embedded in text
+    for robot_id in ROBOT_NAMES:
+        # Look for the robot ID as a standalone number (not part of a larger number)
+        # Match word boundaries - this handles cases where robot ID is in the middle of text
+        pattern = r'\b' + re.escape(robot_id) + r'\b'
+        if re.search(pattern, operator_field):
+            if robot_id not in robots:
+                robots.append(robot_id)
     
     # Validate robot names
     validated_robots = [r for r in robots if r in ROBOT_NAMES]
     
     # Legacy support: "all_done" means all robots completed
-    if "all_done" in text.lower():
+    if "all_done" in operator_field.lower():
         return ROBOT_NAMES.copy()
     
     return validated_robots
@@ -344,6 +360,9 @@ def parse_done_list(operator_field: str) -> List[str]:
 def is_all4_task(task_val: str, operator_field: str) -> bool:
     """
     Determine if a task is an ALL4 task (must run on all 4 robots).
+    
+    Checks if the task value contains "in-domain" or "unseen" (case-insensitive),
+    even if there are extra characters like "In-domain (ALL)" or "UNSEEN ".
     
     Args:
         task_val: Task value from column N
@@ -354,7 +373,18 @@ def is_all4_task(task_val: str, operator_field: str) -> bool:
     """
     if not task_val:
         return False
-    if task_val.strip().lower() in ALL4_TASKS:
+    
+    task_lower = task_val.strip().lower()
+    
+    # Check for exact match first (for efficiency)
+    if task_lower in ALL4_TASKS:
+        return True
+    
+    # Check if task contains "in-domain" or "unseen" as substrings
+    # This handles cases like "In-domain (ALL)", "UNSEEN ", "in-domain test", etc.
+    if "in-domain" in task_lower or "indomain" in task_lower:
+        return True
+    if "unseen" in task_lower:
         return True
     
     # Legacy support: check operator field for hints
@@ -512,30 +542,67 @@ def load_models(client: gspread.Client) -> Tuple[gspread.Worksheet, List[TaskRow
             request_date_str = row[COL_REQUEST_DATE - 1] if len(row) > COL_REQUEST_DATE - 1 else ""
             request_date = parse_date(request_date_str)
             
-            # Filter: only include tasks from today or yesterday
-            if not is_date_in_range(request_date, today, yesterday):
-                continue
-            
+            # Read basic fields to check if it's ALL4 before date filtering
             model = (row[COL_MODEL_NAME - 1] or "").strip()
-            checkpoint = (row[COL_CHECKPOINT - 1] or "").strip()
-            operator_field = row[COL_OPERATOR - 1] if len(row) > COL_OPERATOR - 1 else ""
-            status = normalize_status(row[COL_STATUS - 1] if len(row) > COL_STATUS - 1 else "")
-            robot = (row[COL_ROBOT_ID - 1] if len(row) > COL_ROBOT_ID - 1 else "").strip()
             task_val = row[COL_TASK - 1] if len(row) > COL_TASK - 1 else ""
+            operator_field = row[COL_OPERATOR - 1] if len(row) > COL_OPERATOR - 1 else ""
+            is_all4 = is_all4_task(task_val, operator_field)
+            
+            # Read status early to allow ALL4 tasks in progress to pass through date filter
+            status_raw = row[COL_STATUS - 1] if len(row) > COL_STATUS - 1 else ""
+            status = normalize_status(status_raw)
+            is_all4_in_progress = is_all4 and status == "IN_PROGRESS"
+            
+            # Filter: only include tasks from today or yesterday
+            # EXCEPTION: Include ALL4 tasks that are IN_PROGRESS regardless of date
+            if not is_date_in_range(request_date, today, yesterday):
+                if is_all4_in_progress:
+                    # Allow ALL4 tasks in progress even if date is old
+                    logger.info(
+                        f"Row {i} ({model[:50] if model else 'N/A'}...): ✓ Including ALL4 task in progress despite old date - "
+                        f"request_date: '{request_date_str}' (parsed: {request_date}), "
+                        f"status: '{status_raw}', task: '{task_val}'"
+                    )
+                else:
+                    # Log ALL4 tasks that are filtered out by date
+                    if is_all4:
+                        logger.info(
+                            f"Row {i} ({model[:50] if model else 'N/A'}...): ⚠️  ALL4 task filtered out by date - "
+                            f"request_date: '{request_date_str}' (parsed: {request_date}), "
+                            f"today: {today}, yesterday: {yesterday}, "
+                            f"task: '{task_val}', status: '{status_raw}'"
+                        )
+                    continue
+            
+            checkpoint = (row[COL_CHECKPOINT - 1] or "").strip()
+            robot = (row[COL_ROBOT_ID - 1] if len(row) > COL_ROBOT_ID - 1 else "").strip()
             
             # Skip empty rows
             if not model and not checkpoint:
                 continue
+            
+            done_list = parse_done_list(operator_field)
+            # is_all4 already computed above
+            
+            # Log ALL4 tasks with operator field for debugging
+            if is_all4:
+                logger.info(
+                    f"Row {i} ({model}): ALL4 task detected - "
+                    f"task: '{task_val}', "
+                    f"operator_field: '{operator_field}', "
+                    f"parsed done_list: {done_list}, "
+                    f"status: {status}"
+                )
             
             tasks.append(TaskRow(
                 row=i,
                 model=model,
                 checkpoint=checkpoint,
                 port=parse_port(checkpoint),
-                all4=is_all4_task(task_val, operator_field),
+                all4=is_all4,
                 status=status,
                 robot=robot,
-                done_list=parse_done_list(operator_field),
+                done_list=done_list,
                 task=task_val,
                 request_date=request_date,
             ))
@@ -1073,17 +1140,29 @@ def update_all4_task_status(
         updated_count = 0
         available_robots_set = set(available_robots)
         
+        # Count ALL4 tasks for logging
+        all4_count = sum(1 for t in tasks if t.all4)
+        logger.info(f"Checking {all4_count} ALL4 tasks for status updates...")
+        
         for task in tasks:
             if not task.all4:
                 continue
             
             # Only update if status is PENDING or IN_PROGRESS
             if task.status not in ("PENDING", "IN_PROGRESS"):
+                logger.info(f"Row {task.row} ({task.model}): ⏭️  Skipping ALL4 task - status is '{task.status}', needs to be PENDING or IN_PROGRESS")
                 continue
             
             # Check if at least one robot has completed
             if not task.done_list:
+                logger.info(f"Row {task.row} ({task.model}): ⏭️  Skipping ALL4 task - no robots marked as done in Operator column (Q)")
                 continue
+            
+            logger.info(
+                f"Row {task.row} ({task.model}): Processing ALL4 task - "
+                f"status: {task.status}, robots done: {','.join(task.done_list)}, "
+                f"current robot: {task.robot or '(none)'}"
+            )
             
             # Check if all available robots are done
             done_set = set(task.done_list)
@@ -1095,55 +1174,108 @@ def update_all4_task_status(
                 robot_cell = models_worksheet.cell(task.row, COL_ROBOT_ID)
                 current_robot_id = (robot_cell.value or "").strip()
                 
-                # Check current status value in sheet (not normalized)
+                # Get current status value from sheet (not normalized)
                 status_cell = models_worksheet.cell(task.row, COL_STATUS)
-                current_status = (status_cell.value or "").strip().lower()
+                current_status = (status_cell.value or "").strip()
+                current_status_lower = current_status.lower()
                 
-                # Only update to "Can run now" if:
-                # 1. Current robot has finished (is in done_list), OR
-                # 2. No robot is assigned and status is pending/in_progress
-                # Don't change status if current robot is still running (not in done_list)
+                # Check if current robot has finished
                 current_robot_finished = current_robot_id and current_robot_id in done_set
-                should_update_status = (
-                    current_robot_finished or  # Current robot finished
-                    (not current_robot_id and current_status in ("pending", "in progress", "evaluation in progress"))  # No robot assigned
+                
+                # Find next available robot that hasn't completed this task
+                next_robot = None
+                for robot in available_robots:
+                    if robot not in done_set:
+                        next_robot = robot
+                        break
+                
+                # Determine if we should update the status
+                # Update to "Can run now" if:
+                # 1. At least one robot has completed (done_list is not empty) - already checked above
+                # 2. Not all available robots are done - already checked above
+                # 3. Current status is pending/in_progress/evaluation in progress (not already "Can run now" or "Completed")
+                # 4. We have a next robot to assign
+                # 5. Either the current robot has finished OR no robot is assigned
+                status_needs_update = (
+                    current_status_lower in ("pending", "in progress", "evaluation in progress") and
+                    current_status_lower != "can run now"
                 )
                 
-                if should_update_status and current_status in ("pending", "in progress", "evaluation in progress"):
-                    old_status = status_cell.value  # Keep original for logging
+                has_next_robot = next_robot is not None
+                
+                # Log the decision factors
+                logger.info(
+                    f"Row {task.row} ({task.model}): Update check - "
+                    f"status_needs_update: {status_needs_update} (current: '{current_status}'), "
+                    f"has_next_robot: {has_next_robot} (next: {next_robot}), "
+                    f"current_robot_finished: {current_robot_finished}, "
+                    f"current_robot_id: '{current_robot_id or '(empty)'}', "
+                    f"robots_done: {','.join(task.done_list)}"
+                )
+                
+                # Update if:
+                # 1. Status needs update (is pending/in progress/evaluation in progress)
+                # 2. We have a next robot to assign
+                # 3. Either:
+                #    a. Current robot has finished (is in done_list), OR
+                #    b. No robot is assigned, OR
+                #    c. Current robot is different from next robot (allows reassignment when robot marked done)
+                # The third condition allows updating even if current robot hasn't finished but we have robots done
+                # This handles cases where the robot in column J might be outdated or incorrect
+                should_update = (
+                    status_needs_update and
+                    has_next_robot and
+                    (current_robot_finished or not current_robot_id or current_robot_id != next_robot)
+                )
+                
+                if should_update:
+                    old_status = current_status  # Keep original for logging
+                    old_robot_id = current_robot_id
+                    
+                    # Update status to "Can run now"
                     status_cell.value = "Can run now"
                     updates.append(status_cell)
                     
-                    # Find next available robot that hasn't completed this task
-                    next_robot = None
-                    for robot in available_robots:
-                        if robot not in done_set:
-                            next_robot = robot
-                            break
-                    
                     # Update Robot ID (column J) to next robot
-                    # Only update if current robot finished or no robot assigned
-                    if next_robot and (current_robot_finished or not current_robot_id):
+                    # Always update if next robot is different from current
+                    if current_robot_id != next_robot:
                         robot_cell.value = next_robot
                         updates.append(robot_cell)
                         logger.info(
                             f"Row {task.row} ({task.model}): Updated status from '{old_status}' to 'Can run now' "
-                            f"and assigned Robot ID from '{current_robot_id}' to {next_robot} "
+                            f"and assigned Robot ID from '{old_robot_id or '(empty)'}' to {next_robot} "
                             f"(robots done: {','.join(task.done_list)}, available: {','.join(sorted(available_robots))})"
                         )
-                    elif not next_robot:
-                        logger.warning(
-                            f"Row {task.row} ({task.model}): No available robot found to assign "
-                            f"(robots done: {','.join(task.done_list)}, available: {','.join(sorted(available_robots))})"
+                    else:
+                        logger.info(
+                            f"Row {task.row} ({task.model}): Updated status from '{old_status}' to 'Can run now' "
+                            f"(Robot ID already correct: {current_robot_id}, robots done: {','.join(task.done_list)})"
                         )
                     
                     updated_count += 1
-                elif current_robot_id and current_robot_id not in done_set:
-                    # Current robot is still running - don't change status
-                    logger.debug(
-                        f"Row {task.row} ({task.model}): Robot {current_robot_id} is still running, "
-                        f"not updating status (robots done: {','.join(task.done_list)})"
-                    )
+                else:
+                    # Log why we're not updating (use INFO level so it's visible)
+                    if not status_needs_update:
+                        logger.info(
+                            f"Row {task.row} ({task.model}): ❌ NOT UPDATING - Status '{current_status}' doesn't need update "
+                            f"(should be pending/in progress/evaluation in progress, robots done: {','.join(task.done_list)})"
+                        )
+                    elif not has_next_robot:
+                        logger.info(
+                            f"Row {task.row} ({task.model}): ❌ NOT UPDATING - No available robot found to assign "
+                            f"(robots done: {','.join(task.done_list)}, available: {','.join(sorted(available_robots))})"
+                        )
+                    elif current_robot_id and current_robot_id not in done_set:
+                        logger.info(
+                            f"Row {task.row} ({task.model}): ❌ NOT UPDATING - Robot {current_robot_id} is still running "
+                            f"(not in done_list: {','.join(task.done_list)})"
+                        )
+                    else:
+                        logger.info(
+                            f"Row {task.row} ({task.model}): ❌ NOT UPDATING - Conditions not met "
+                            f"(status_needs_update: {status_needs_update}, has_next_robot: {has_next_robot}, "
+                            f"current_robot_finished: {current_robot_finished}, current_robot_id: '{current_robot_id or '(empty)'}')"
+                        )
         
         if updates:
             models_worksheet.update_cells(updates, value_input_option="USER_ENTERED")
@@ -1201,13 +1333,33 @@ def schedule_tasks(
         # Priority: ALL4 tasks first (but only one robot per ALL4 task), then normal tasks
         
         # Phase 1: Try to assign an ALL4 task that this robot hasn't completed
+        # Priority: Tasks with status "Can run now" and column J already set to this robot
         # But only if no other robot has been assigned this ALL4 task in this run
+        
+        # First pass: Look for tasks with "Can run now" status that are assigned to this robot
+        prioritized_tasks = []
+        other_tasks = []
         for task in all4_tasks:
             if task.row in assigned_all4_tasks:
-                continue  # This ALL4 task already assigned to another robot in this run
+                continue
             if robot in task.done_list:
                 skip_reasons.append(f"Row {task.row} ({task.model}): ALL4 task already done by {robot}")
                 continue
+            
+            # Check if this task is "Can run now" and assigned to this robot
+            if task.robot == robot:
+                # Get the actual status from the sheet to check for "Can run now"
+                # We'll check this during assignment
+                prioritized_tasks.append(task)
+            else:
+                other_tasks.append(task)
+        
+        # Process prioritized tasks first, then others
+        for task in prioritized_tasks + other_tasks:
+            if task.row in assigned_all4_tasks:
+                continue  # This ALL4 task already assigned to another robot in this run
+            if robot in task.done_list:
+                continue  # Already skipped above
             
             # Check if this robot can run it (model+port conflict)
             if task.port and (task.model, task.port) in assigned_ports:
