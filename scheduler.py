@@ -96,7 +96,9 @@ SCHEDULING RULES:
      - "pending" or "in progress" => eligible to be scheduled (if robot hasn't completed it and no port conflict)
      - "Completed" => not schedulable (all robots done)
    - "Cancelled" / "Vibe Check Requested" => blocked, not schedulable
-6. Priority: ALL4 tasks are scheduled before normal tasks
+6. Priority ordering: Tasks are sorted by priority from column L (p0 > p1 > p2 > p3)
+   - Within each task type (ALL4 vs normal), tasks are ordered by priority
+   - ALL4 tasks are scheduled before normal tasks, but both respect priority ordering
 """
 
 import logging
@@ -129,6 +131,7 @@ COL_REQUEST_DATE = 1   # A
 COL_MODEL_NAME = 3     # C
 COL_CHECKPOINT = 5     # E
 COL_ROBOT_ID = 10      # J
+COL_PRIORITY = 12      # L
 COL_STATUS = 13        # M
 COL_TASK = 14          # N
 COL_OPERATOR = 17      # Q (used for robots_done metadata)
@@ -164,6 +167,7 @@ class TaskRow:
     done_list: List[str]  # List of robots that have completed this task (for ALL4 tasks)
     task: str  # Original task value from col N
     request_date: Optional[date]  # Request date from column A
+    priority: str  # Priority from column L (p0, p1, p2, p3)
 
 
 @dataclass
@@ -292,6 +296,35 @@ def normalize_status(status: str) -> str:
     if s in ("cancelled", "vibe check requested"):
         return "BLOCKED"
     return "BLOCKED"
+
+
+def get_priority_value(priority: str) -> int:
+    """
+    Get numeric priority value for sorting (lower number = higher priority).
+    
+    Priority order: p0 (highest) > p1 > p2 > p3 (lowest)
+    Invalid or missing priorities get lowest priority (4).
+    
+    Args:
+        priority: Priority string from column L (e.g., "p0", "p1", "p2", "p3")
+    
+    Returns:
+        Integer priority value: 0 for p0, 1 for p1, 2 for p2, 3 for p3, 4 for invalid/missing
+    """
+    if not priority:
+        return 4  # Lowest priority for missing values
+    
+    priority_lower = priority.lower().strip()
+    if priority_lower == "p0":
+        return 0
+    elif priority_lower == "p1":
+        return 1
+    elif priority_lower == "p2":
+        return 2
+    elif priority_lower == "p3":
+        return 3
+    else:
+        return 4  # Lowest priority for invalid values
 
 
 def parse_done_list(operator_field: str) -> List[str]:
@@ -535,7 +568,7 @@ def load_models(client: gspread.Client) -> Tuple[gspread.Worksheet, List[TaskRow
         # Skip header row (index 0), start from row 2 (1-indexed)
         for i, row in enumerate(rows[1:], start=2):
             # Handle rows that might be shorter than expected
-            if len(row) < max(COL_MODEL_NAME, COL_CHECKPOINT, COL_STATUS, COL_TASK, COL_OPERATOR):
+            if len(row) < max(COL_MODEL_NAME, COL_CHECKPOINT, COL_STATUS, COL_TASK, COL_OPERATOR, COL_PRIORITY):
                 continue
             
             # Read request date from column A
@@ -576,6 +609,7 @@ def load_models(client: gspread.Client) -> Tuple[gspread.Worksheet, List[TaskRow
             
             checkpoint = (row[COL_CHECKPOINT - 1] or "").strip()
             robot = (row[COL_ROBOT_ID - 1] if len(row) > COL_ROBOT_ID - 1 else "").strip()
+            priority = (row[COL_PRIORITY - 1] if len(row) > COL_PRIORITY - 1 else "").strip().lower()
             
             # Skip empty rows
             if not model and not checkpoint:
@@ -605,6 +639,7 @@ def load_models(client: gspread.Client) -> Tuple[gspread.Worksheet, List[TaskRow
                 done_list=done_list,
                 task=task_val,
                 request_date=request_date,
+                priority=priority,
             ))
         
         logger.info(f"Loaded {len(tasks)} tasks from Eval Queue sheet (filtered to today and yesterday only)")
@@ -1301,10 +1336,11 @@ def schedule_tasks(
     Optimized scheduler that assigns tasks to minimize idle time and respect all constraints.
     
     Scheduling Rules:
-    1. Model + Port conflict: Same (model, port) = only one robot at a time
-    2. Port-only: Same port, different model = can run in parallel
-    3. ALL4 tasks: Must run on all robots, but only one robot per ALL4 task per run (sequential)
-    4. Optimization: Minimize idle time, balance load, finish in minimum total time
+    1. Priority ordering: Tasks are sorted by priority (p0 > p1 > p2 > p3) from column L
+    2. Model + Port conflict: Same (model, port) = only one robot at a time
+    3. Port-only: Same port, different model = can run in parallel
+    4. ALL4 tasks: Must run on all robots, but only one robot per ALL4 task per run (sequential)
+    5. Optimization: Minimize idle time, balance load, finish in minimum total time
     
     Args:
         tasks: List of all tasks
@@ -1320,9 +1356,12 @@ def schedule_tasks(
     assigned_ports = used_ports.copy()  # Track (model, port) assignments
     assigned_ports_only = set()  # Track ports in use (for port-only conflict checking)
     
-    # Separate tasks into ALL4 and normal
+    # Separate tasks into ALL4 and normal, sorted by priority (p0 > p1 > p2 > p3)
     all4_tasks = [t for t in tasks if t.all4 and t.status not in ("COMPLETED", "BLOCKED")]
+    all4_tasks.sort(key=lambda t: get_priority_value(t.priority))
+    
     normal_tasks = [t for t in tasks if not t.all4 and t.status == "PENDING"]
+    normal_tasks.sort(key=lambda t: get_priority_value(t.priority))
     
     # Build assignments for each robot
     for robot in available_robots:
@@ -1337,6 +1376,7 @@ def schedule_tasks(
         # But only if no other robot has been assigned this ALL4 task in this run
         
         # First pass: Look for tasks with "Can run now" status that are assigned to this robot
+        # Sort by priority within each group
         prioritized_tasks = []
         other_tasks = []
         for task in all4_tasks:
@@ -1353,6 +1393,10 @@ def schedule_tasks(
                 prioritized_tasks.append(task)
             else:
                 other_tasks.append(task)
+        
+        # Sort both lists by priority (p0 > p1 > p2 > p3)
+        prioritized_tasks.sort(key=lambda t: get_priority_value(t.priority))
+        other_tasks.sort(key=lambda t: get_priority_value(t.priority))
         
         # Process prioritized tasks first, then others
         for task in prioritized_tasks + other_tasks:
